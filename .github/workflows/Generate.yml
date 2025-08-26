@@ -20,7 +20,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update -y
-        sudo apt-get install -y git python3 python3-pip unzip curl
+        sudo apt-get install -y git python3 python3-pip unzip curl p7zip-full
         pip3 install dumpyara aospdtgen gdown
 
     - name: Download firmware
@@ -29,18 +29,29 @@ jobs:
         gdown "$FIRMWARE_ID" -O firmware/fw.zip
         ls -lh firmware
 
-    - name: Extract firmware with dumpyara
+    - name: Extract firmware
       run: |
         cd firmware
-        python3 -m dumpyara fw.zip || echo "⚠️ dumpyara failed, continuing..."
-        ls -lh
+        # Try dumpyara first
+        python3 -m dumpyara fw.zip || echo "⚠️ dumpyara failed, trying 7z..."
+        # If dumpyara produced nothing useful, fallback to 7z
+        if [ $(find . -maxdepth 1 -type d | wc -l) -le 1 ]; then
+          mkdir extracted && cd extracted
+          7z x ../fw.zip
+          cd ..
+        fi
+        ls -lhR
 
     - name: Find dump dir
       id: dump
       run: |
-        DUMP_DIR=$(find firmware -maxdepth 1 -type d ! -path firmware | head -n1)
+        if [ -d "firmware/extracted" ]; then
+          DUMP_DIR="firmware/extracted"
+        else
+          DUMP_DIR=$(find firmware -maxdepth 1 -type d ! -path firmware | head -n1)
+        fi
         echo "dump_dir=$DUMP_DIR" >> $GITHUB_OUTPUT
-        echo "Dump dir: $DUMP_DIR"
+        echo "Using dump dir: $DUMP_DIR"
         ls -lh "$DUMP_DIR" || true
 
     - name: Generate device tree
@@ -87,7 +98,6 @@ jobs:
       if: always()
       run: |
         mkdir logs
-        cp $GITHUB_WORKSPACE/../*/*.txt logs/ || true
         dmesg > logs/dmesg.txt || true
         journalctl -xe > logs/journal.txt || true
 
@@ -110,4 +120,3 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TG_CHAT_ID}" \
             -d text="❌ Device tree generation failed or empty. Logs available.\nRun: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-        fi
