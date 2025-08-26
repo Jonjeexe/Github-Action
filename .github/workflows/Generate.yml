@@ -69,9 +69,15 @@ jobs:
 
     - name: Zip device tree
       run: |
-        zip -r device-tree-X6815D.zip device/infinix/X6815D || true
+        if [ -d "device/infinix/X6815D" ] && [ "$(ls -A device/infinix/X6815D)" ]; then
+          zip -r device-tree-X6815D.zip device/infinix/X6815D
+        else
+          echo "⚠️ No device tree generated!"
+          echo "NO_TREE=true" >> $GITHUB_ENV
+        fi
 
     - name: Upload device tree artifact
+      if: env.NO_TREE != 'true'
       uses: actions/upload-artifact@v4
       with:
         name: device-tree-X6815D
@@ -84,7 +90,6 @@ jobs:
         cp $GITHUB_WORKSPACE/../*/*.txt logs/ || true
         dmesg > logs/dmesg.txt || true
         journalctl -xe > logs/journal.txt || true
-        echo "Logs saved"
 
     - name: Upload logs artifact
       if: failure()
@@ -93,14 +98,16 @@ jobs:
         name: build-logs
         path: logs
 
-    - name: Send Telegram notification
+    - name: Telegram notification + send zip
       if: always()
       run: |
-        STATUS="✅ Device tree generated successfully!"
-        if [ "${{ job.status }}" != "success" ]; then
-          STATUS="❌ Workflow failed. Logs uploaded."
+        if [ "${{ job.status }}" == "success" ] && [ -f "device-tree-X6815D.zip" ]; then
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
+            -F chat_id="${TG_CHAT_ID}" \
+            -F document=@device-tree-X6815D.zip \
+            -F caption="📦 Device Tree (X6815D) generated successfully! Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        else
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" \
+            -d text="❌ Device tree generation failed or empty. Logs available.\nRun: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
         fi
-        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-          -d chat_id="${TG_CHAT_ID}" \
-          -d parse_mode="Markdown" \
-          -d text="*X6815D Device Tree Build*\n\nStatus: ${STATUS}\nRun: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
