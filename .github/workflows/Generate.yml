@@ -9,7 +9,7 @@ jobs:
   build-tree:
     runs-on: ubuntu-latest
     env:
-      FIRMWARE_URL: "https://drive.usercontent.google.com/download?id=1-65PV4enM35j72dhMa4STSMwLNdqR-NV&export=download&authuser=1"
+      FIRMWARE_ID: "1-65PV4enM35j72dhMa4STSMwLNdqR-NV" # Google Drive ID
       TG_CHAT_ID: "1910625218"
       TG_BOT_TOKEN: "7863915048:AAG0PjWioCIeIlP9kDdvsTDkKfJ2J57dR-Q"
 
@@ -17,22 +17,22 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@v4
 
-    - name: Install deps
+    - name: Install dependencies
       run: |
         sudo apt-get update -y
         sudo apt-get install -y git python3 python3-pip unzip curl
-        pip3 install dumpyara aospdtgen
+        pip3 install dumpyara aospdtgen gdown
 
     - name: Download firmware
       run: |
         mkdir -p firmware
-        curl -L -o firmware/fw.zip "${FIRMWARE_URL}"
+        gdown "$FIRMWARE_ID" -O firmware/fw.zip
         ls -lh firmware
 
     - name: Extract firmware with dumpyara
       run: |
         cd firmware
-        python3 -m dumpyara fw.zip || true
+        python3 -m dumpyara fw.zip || echo "⚠️ dumpyara failed, continuing..."
         ls -lh
 
     - name: Find dump dir
@@ -40,38 +40,42 @@ jobs:
       run: |
         DUMP_DIR=$(find firmware -maxdepth 1 -type d ! -path firmware | head -n1)
         echo "dump_dir=$DUMP_DIR" >> $GITHUB_OUTPUT
-        ls -lh "$DUMP_DIR"
+        echo "Dump dir: $DUMP_DIR"
+        ls -lh "$DUMP_DIR" || true
 
     - name: Generate device tree
       run: |
         DUMP="${{ steps.dump.outputs.dump_dir }}"
-        python3 -m aospdtgen -o device/infinix/X6815D "$DUMP"
-        ls -lh device/infinix/X6815D
+        mkdir -p device/infinix/X6815D
+        python3 -m aospdtgen -o device/infinix/X6815D "$DUMP" || echo "⚠️ aospdtgen failed, check logs"
+        ls -lh device/infinix/X6815D || true
 
     - name: Extract boot.img & prebuilt kernel
       run: |
         mkdir -p device/infinix/X6815D/prebuilt
         DUMP="${{ steps.dump.outputs.dump_dir }}"
         BOOTIMG=$(find "$DUMP" -type f -iname "boot*.img" | head -n1 || true)
-        if [ -z "$BOOTIMG" ]; then
-          echo "No boot.img found, skipping kernel extraction"
-        else
+        if [ -n "$BOOTIMG" ]; then
           echo "Found boot.img: $BOOTIMG"
           curl -L -o magisk.zip https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk-v28.1.zip || true
           unzip -j magisk.zip "*/magiskboot" -d .
           chmod +x magiskboot || true
           ./magiskboot unpack "$BOOTIMG" || true
-          for f in kernel dtb dtbo.img ramdisk.cpio; do
-            [ -f "$f" ] && mv "$f" device/infinix/X6815D/prebuilt/"$f"
-          done
+          mv -f kernel* dtb* dtbo.img* ramdisk.cpio* device/infinix/X6815D/prebuilt/ 2>/dev/null || true
+        else
+          echo "⚠️ No boot.img found, skipping kernel extraction"
         fi
         ls -lh device/infinix/X6815D/prebuilt || true
+
+    - name: Zip device tree
+      run: |
+        zip -r device-tree-X6815D.zip device/infinix/X6815D || true
 
     - name: Upload device tree artifact
       uses: actions/upload-artifact@v4
       with:
         name: device-tree-X6815D
-        path: device/infinix/X6815D
+        path: device-tree-X6815D.zip
 
     - name: Save workflow logs
       if: always()
@@ -100,4 +104,3 @@ jobs:
           -d chat_id="${TG_CHAT_ID}" \
           -d parse_mode="Markdown" \
           -d text="*X6815D Device Tree Build*\n\nStatus: ${STATUS}\nRun: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          
