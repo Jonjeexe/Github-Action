@@ -9,7 +9,7 @@ jobs:
   build-tree:
     runs-on: ubuntu-latest
     env:
-      FIRMWARE_ID: "1-65PV4enM35j72dhMa4STSMwLNdqR-NV" # Google Drive ID
+      FIRMWARE_ID: "1-65PV4enM35j72dhMa4STSMwLNdqR-NV"
       TG_CHAT_ID: "1910625218"
       TG_BOT_TOKEN: "7863915048:AAG0PjWioCIeIlP9kDdvsTDkKfJ2J57dR-Q"
 
@@ -23,100 +23,109 @@ jobs:
         sudo apt-get install -y git python3 python3-pip unzip curl p7zip-full
         pip3 install dumpyara aospdtgen gdown
 
-    - name: Download firmware
+    - name: Download firmware from Google Drive
       run: |
         mkdir -p firmware
         gdown "$FIRMWARE_ID" -O firmware/fw.zip
         ls -lh firmware
 
-    - name: Extract firmware
+    - name: Extract firmware contents
       run: |
         cd firmware
-        # Try dumpyara first
-        python3 -m dumpyara fw.zip || echo "⚠️ dumpyara failed, trying 7z..."
-        # If dumpyara produced nothing useful, fallback to 7z
-        if [ $(find . -maxdepth 1 -type d | wc -l) -le 1 ]; then
-          mkdir extracted && cd extracted
-          7z x ../fw.zip
-          cd ..
+        python3 -m dumpyara fw.zip && ST=0 || ST=$?
+        if [ $ST -ne 0 ] || [ -z "$(find . -type f)" ]; then
+          echo "::warning::dumpyara failed or extracted nothing — trying 7z"
+          7z x fw.zip -oextracted || true
         fi
-        ls -lhR
+        cd extracted || cd .
+        echo "=== Extracted contents ==="
+        ls -lhR . || true
 
-    - name: Find dump dir
+    - name: Determine dump directory
       id: dump
       run: |
-        if [ -d "firmware/extracted" ]; then
-          DUMP_DIR="firmware/extracted"
+        if [ -d "firmware/extracted" ] && [ -n "$(ls firmware/extracted)" ]; then
+          DUMP="firmware/extracted"
         else
-          DUMP_DIR=$(find firmware -maxdepth 1 -type d ! -path firmware | head -n1)
+          DUMP=$(find firmware -maxdepth 2 -type f \( -iname "boot*.img" -o -iname "vendor*.img" \) -printf '%h\n' | head -n1)
         fi
-        echo "dump_dir=$DUMP_DIR" >> $GITHUB_OUTPUT
-        echo "Using dump dir: $DUMP_DIR"
-        ls -lh "$DUMP_DIR" || true
+        echo "::debug::Using dump directory: $DUMP"
+        echo "dump_dir=$DUMP" >> $GITHUB_OUTPUT
 
-    - name: Generate device tree
+    - name: Validate dump contents
+      run: |
+        DUMP="${{ steps.dump.outputs.dump_dir }}"
+        echo "::group::Contents of dump folder"
+        ls -lh "$DUMP" || true
+        echo "::endgroup::"
+        if [ -z "$(ls "$DUMP" 2>/dev/null)" ]; then
+          echo "::error::No valid dump directory found — skipping device tree generation"
+          exit 1
+        fi
+
+    - name: Generate device tree with aospdtgen
       run: |
         DUMP="${{ steps.dump.outputs.dump_dir }}"
         mkdir -p device/infinix/X6815D
-        python3 -m aospdtgen -o device/infinix/X6815D "$DUMP" || echo "⚠️ aospdtgen failed, check logs"
+        python3 -m aospdtgen -o device/infinix/X6815D "$DUMP" || echo "::warning::aospdtgen may have failed. Inspect logs."
         ls -lh device/infinix/X6815D || true
 
-    - name: Extract boot.img & prebuilt kernel
+    - name: Extract kernel from boot.img
       run: |
+        BOOTIMG=$(find "${{ steps.dump.outputs.dump_dir }}" -type f -iname "boot*.img" | head -n1)
         mkdir -p device/infinix/X6815D/prebuilt
-        DUMP="${{ steps.dump.outputs.dump_dir }}"
-        BOOTIMG=$(find "$DUMP" -type f -iname "boot*.img" | head -n1 || true)
         if [ -n "$BOOTIMG" ]; then
-          echo "Found boot.img: $BOOTIMG"
+          echo "Found boot image: $BOOTIMG"
           curl -L -o magisk.zip https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk-v28.1.zip || true
           unzip -j magisk.zip "*/magiskboot" -d .
           chmod +x magiskboot || true
           ./magiskboot unpack "$BOOTIMG" || true
           mv -f kernel* dtb* dtbo.img* ramdisk.cpio* device/infinix/X6815D/prebuilt/ 2>/dev/null || true
         else
-          echo "⚠️ No boot.img found, skipping kernel extraction"
+          echo "::warning::No boot.img found, skipping extraction"
         fi
         ls -lh device/infinix/X6815D/prebuilt || true
 
-    - name: Zip device tree
+    - name: Prepare ZIP of device tree
       run: |
-        if [ -d "device/infinix/X6815D" ] && [ "$(ls -A device/infinix/X6815D)" ]; then
+        if [ -n "$(find device/infinix/X6815D -type f -maxdepth 2)" ]; then
           zip -r device-tree-X6815D.zip device/infinix/X6815D
         else
-          echo "⚠️ No device tree generated!"
+          echo "::warning::Device tree is empty — skipping zip"
           echo "NO_TREE=true" >> $GITHUB_ENV
         fi
 
-    - name: Upload device tree artifact
+    - name: Upload device tree artifact (if exists)
       if: env.NO_TREE != 'true'
       uses: actions/upload-artifact@v4
       with:
         name: device-tree-X6815D
         path: device-tree-X6815D.zip
 
-    - name: Save workflow logs
-      if: always()
+    - name: Save logs for failure
+      if: failure()
       run: |
         mkdir logs
         dmesg > logs/dmesg.txt || true
         journalctl -xe > logs/journal.txt || true
 
-    - name: Upload logs artifact
+    - name: Upload logs (on failure)
       if: failure()
       uses: actions/upload-artifact@v4
       with:
         name: build-logs
         path: logs
 
-    - name: Telegram notification + send zip
+    - name: Telegram notification + optional zip
       if: always()
       run: |
+        RUNURL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
         if [ "${{ job.status }}" == "success" ] && [ -f "device-tree-X6815D.zip" ]; then
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
             -F chat_id="${TG_CHAT_ID}" \
             -F document=@device-tree-X6815D.zip \
-            -F caption="📦 Device Tree (X6815D) generated successfully! Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            -F caption="✅ Device Tree (X6815D) generated successfully!\nRun: $RUNURL"
         else
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TG_CHAT_ID}" \
-            -d text="❌ Device tree generation failed or empty. Logs available.\nRun: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            -d text="❌ Device Tree generation failed or produced nothing.\nRun: $RUNURL"
