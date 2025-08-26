@@ -21,7 +21,7 @@ jobs:
       run: |
         sudo apt-get update -y
         sudo apt-get install -y git python3 python3-pip unzip curl p7zip-full
-        pip3 install dumpyara aospdtgen gdown
+        pip3 install dumpyara aospdtgen gdown oppo-decrypt
 
     - name: Download firmware
       run: |
@@ -29,46 +29,58 @@ jobs:
         gdown "$FIRMWARE_ID" -O firmware/fw.zip
         ls -lh firmware/
 
-    - name: Extract firmware (multiple methods)
+    - name: Extract firmware (ZIP, 7z, unzip)
       run: |
         cd firmware
-        # Try dumpyara
         echo "::group::Trying dumpyara"
-        python3 -m dumpyara fw.zip || echo "::warning:: dumpyara failed"
+        python3 -m dumpyara fw.zip || echo "::warning::dumpyara failed"
         ls -lh .
         echo "::endgroup::"
-        # Fallback to 7z
-        echo "::group::Trying 7z fallback"
-        7z x fw.zip -oextracted || echo "::warning:: 7z extraction failed"
+        echo "::group::Trying 7z"
+        7z x fw.zip -oextracted || echo "::warning::7z failed"
         ls -lh extracted/
         echo "::endgroup::"
-        # Fallback to unzip
-        echo "::group::Trying unzip fallback"
-        unzip fw.zip -d extracted2 || echo "::warning:: unzip failed"
+        echo "::group::Trying unzip"
+        unzip fw.zip -d extracted2 || echo "::warning::unzip failed"
         ls -lh extracted2/
         echo "::endgroup::"
 
-    - name: Pick dump directory
+    - name: Extract firmware using oppo_decrypt (fallback for OFP)
+      run: |
+        cd firmware
+        OFP=$(ls *.ofp 2>/dev/null | head -n1 || true)
+        if [ -n "$OFP" ]; then
+          echo "::group::Extracting OFP with oppo_decrypt"
+          python3 -m oppo_decrypt "$OFP" ofp_extracted || echo "::warning::oppo_decrypt failed"
+          ls -lh ofp_extracted/
+          echo "::endgroup::"
+        else
+          echo "::warning::No .ofp firmware found for decryption"
+        fi
+
+    - name: Choose dump directory
       id: dump
       run: |
-        if [ -d "firmware/extracted" ] && [ -n "$(ls firmware/extracted)" ]; then
-          DUMP="firmware/extracted"
-        elif [ -d "firmware/extracted2" ] && [ -n "$(ls firmware/extracted2)" ]; then
-          DUMP="firmware/extracted2"
+        if [ -d "firmware/ofp_extracted" ] && [ "$(ls firmware/ofp_extracted)" ]; then
+          DUMP=firmware/ofp_extracted
+        elif [ -d "firmware/extracted" ] && [ "$(ls firmware/extracted)" ]; then
+          DUMP=firmware/extracted
+        elif [ -d "firmware/extracted2" ] && [ "$(ls firmware/extracted2)" ]; then
+          DUMP=firmware/extracted2
         else
-          DUMP=$(find firmware -type f \( -iname "boot*.img" -o -iname "vendor*.img" \) -printf '%h\n' | head -n1 || true)
+          DUMP=$(find firmware -type f \( -iname "boot*.img" -o -iname "vendor*.img" \) -printf '%h\n' | head -n1 || echo "")
         fi
-        echo "::debug:: Using dump directory: $DUMP"
+        echo "::debug::Using dump: $DUMP"
         echo "dump_dir=$DUMP" >> $GITHUB_OUTPUT
 
-    - name: Check dump contents
+    - name: Confirm dump contents
       run: |
         DUMP="${{ steps.dump.outputs.dump_dir }}"
-        echo "::group::Dump folder listing"
-        ls -lh "$DUMP" || echo "::warning:: Dump directory not found"
+        echo "::group::Dump contents"
+        ls -lh "$DUMP" || echo "::warning::Dump dir not found"
         echo "::endgroup::"
-        if ! ls "$DUMP"/*.{img,IMG} 1> /dev/null 2>&1; then
-          echo "::error:: No .img files found, aborting"
+        if [ -z "$(ls -A "$DUMP" 2>/dev/null)" ]; then
+          echo "::error::No files in dump. Aborting"
           exit 1
         fi
 
@@ -76,50 +88,33 @@ jobs:
       run: |
         DUMP="${{ steps.dump.outputs.dump_dir }}"
         mkdir -p device/infinix/X6815D
-        python3 -m aospdtgen -o device/infinix/X6815D "$DUMP" || echo "::warning:: aospdtgen may have failed"
+        python3 -m aospdtgen -o device/infinix/X6815D "$DUMP" || echo "::warning::aospdtgen failed"
         ls -lh device/infinix/X6815D/
-
-    - name: Extract kernel from boot.img
-      run: |
-        DUMP="${{ steps.dump.outputs.dump_dir }}"
-        BOOTIMG=$(find "$DUMP" -type f -iname "boot*.img" | head -n1 || true)
-        mkdir -p device/infinix/X6815D/prebuilt
-        if [ -n "$BOOTIMG" ]; then
-          echo "Found boot image: $BOOTIMG"
-          curl -L -o magisk.zip https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk-v28.1.zip || true
-          unzip -j magisk.zip "*/magiskboot" -d .
-          chmod +x magiskboot || true
-          ./magiskboot unpack "$BOOTIMG" || echo "::warning:: magiskboot unpack failed"
-          mv -f kernel* dtb* dtbo.img* ramdisk.cpio* device/infinix/X6815D/prebuilt/ 2>/dev/null || true
-        else
-          echo "::warning:: No boot.img found"
-        fi
-        ls -lh device/infinix/X6815D/prebuilt/
 
     - name: Zip device tree
       run: |
         if [ -n "$(find device/infinix/X6815D -type f -maxdepth 2)" ]; then
           zip -r device-tree-X6815D.zip device/infinix/X6815D
         else
-          echo "::warning:: Device tree is empty"
+          echo "::warning::Device tree empty"
           echo "NO_TREE=true" >> $GITHUB_ENV
         fi
 
-    - name: Upload device tree zip
+    - name: Upload device tree
       if: env.NO_TREE != 'true'
       uses: actions/upload-artifact@v4
       with:
         name: device-tree-X6815D
         path: device-tree-X6815D.zip
 
-    - name: Save logs
+    - name: Save logs on failure
       if: failure()
       run: |
         mkdir -p logs
         dmesg > logs/dmesg.txt || true
         journalctl -xe > logs/journal.txt || true
 
-    - name: Upload logs (on failure)
+    - name: Upload logs on failure
       if: failure()
       uses: actions/upload-artifact@v4
       with:
@@ -129,13 +124,13 @@ jobs:
     - name: Telegram notification
       if: always()
       run: |
-        RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        LINK="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
         if [ "${{ job.status }}" == "success" ] && [ -f "device-tree-X6815D.zip" ]; then
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
             -F chat_id="${TG_CHAT_ID}" \
             -F document=@device-tree-X6815D.zip \
-            -F caption="✅ Device tree generated: Run $RUN_URL"
+            -F caption="✅ Tree generated! Run: $LINK"
         else
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TG_CHAT_ID}" \
-            -d text="❌ Generation failed or empty. Logs: $RUN_URL"
+            -d text="❌ Generation failed or empty. Logs: $LINK"
